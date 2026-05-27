@@ -1,0 +1,35 @@
+run:
+  timeout: 5m
+  go: "1.22"
+
+linters:
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gofmt
+    - goimports
+    - revive
+    - exhaustive
+    - gocritic
+    - misspell
+
+linters-settings:
+  revive:
+    rules:
+      - name: exported
+      - name: var-naming
+      - name: error-return
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - style
+
+issues:
+  exclude-rules:
+    # Allow unused error returns on Rollback/Close/Write in deferred calls.
+    - text: "Error return value of .*(Rollback|Close|Write|Drain|Ack|Nak).*is not checked"
+      linter: errcheck
