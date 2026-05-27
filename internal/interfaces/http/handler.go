@@ -11,26 +11,26 @@ import (
 	"github.com/bryanwahyu/flip-style-transfer-engine/internal/application/command"
 	"github.com/bryanwahyu/flip-style-transfer-engine/internal/application/port"
 	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/account"
-	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/ledger"
+	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/money"
 	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/transfer"
 	"github.com/bryanwahyu/flip-style-transfer-engine/internal/infrastructure/observability"
 )
 
-// Handler holds all HTTP dependencies and implements the route handlers.
+// Handler holds HTTP dependencies and implements the route handlers.
 type Handler struct {
 	createTransfer *command.CreateTransferHandler
-	transfers      port.TransferRepository
-	accounts       port.AccountRepository
-	ledgerRepo     port.LedgerRepository
+	transfers      port.TransferReader
+	accounts       port.AccountReader
+	balances       port.BalanceReader
 	idempotency    port.IdempotencyStore
 	log            *slog.Logger
 }
 
 func NewHandler(
 	createTransfer *command.CreateTransferHandler,
-	transfers port.TransferRepository,
-	accounts port.AccountRepository,
-	ledgerRepo port.LedgerRepository,
+	transfers port.TransferReader,
+	accounts port.AccountReader,
+	balances port.BalanceReader,
 	idempotency port.IdempotencyStore,
 	log *slog.Logger,
 ) *Handler {
@@ -38,22 +38,19 @@ func NewHandler(
 		createTransfer: createTransfer,
 		transfers:      transfers,
 		accounts:       accounts,
-		ledgerRepo:     ledgerRepo,
+		balances:       balances,
 		idempotency:    idempotency,
 		log:            log,
 	}
 }
 
-// createTransferRequest is the JSON body for POST /v1/transfers.
 type createTransferRequest struct {
 	SourceAccountID string `json:"source_account_id"`
 	DestAccountID   string `json:"dest_account_id"`
 	Amount          int64  `json:"amount"`
 	Currency        string `json:"currency"`
-	Description     string `json:"description"`
 }
 
-// CreateTransfer handles POST /v1/transfers.
 func (h *Handler) CreateTransfer(w http.ResponseWriter, r *http.Request) {
 	log := observability.FromContext(r.Context(), h.log)
 
@@ -63,15 +60,12 @@ func (h *Handler) CreateTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	idempotencyKey := idempotencyKeyFromCtx(r.Context())
-
 	result, err := h.createTransfer.Handle(r.Context(), command.CreateTransferCmd{
-		IdempotencyKey:  idempotencyKey,
+		IdempotencyKey:  idempotencyKeyFromCtx(r.Context()),
 		SourceAccountID: req.SourceAccountID,
 		DestAccountID:   req.DestAccountID,
 		Amount:          req.Amount,
-		Currency:        ledger.Currency(req.Currency),
-		Description:     req.Description,
+		Currency:        money.Currency(req.Currency),
 	})
 	if err != nil {
 		log.Error("create transfer failed", "error", err)
@@ -86,7 +80,6 @@ func (h *Handler) CreateTransfer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, result)
 }
 
-// GetTransfer handles GET /v1/transfers/{id}.
 func (h *Handler) GetTransfer(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	transferID, err := transfer.ParseTransferID(id)
@@ -94,7 +87,6 @@ func (h *Handler) GetTransfer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_transfer_id", err.Error())
 		return
 	}
-
 	t, err := h.transfers.FindByID(r.Context(), transferID)
 	if errors.Is(err, transfer.ErrTransferNotFound) {
 		writeError(w, http.StatusNotFound, "transfer_not_found", "transfer not found")
@@ -104,10 +96,8 @@ func (h *Handler) GetTransfer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 		return
 	}
-
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"id":                t.ID.String(),
-		"state":             string(t.State),
+		"id": t.ID.String(), "state": string(t.State),
 		"source_account_id": t.SourceAccountID.String(),
 		"dest_account_id":   t.DestAccountID.String(),
 		"amount":            t.Amount.Amount,
@@ -119,15 +109,13 @@ func (h *Handler) GetTransfer(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GetAccountBalance handles GET /v1/accounts/{id}/balance.
 func (h *Handler) GetAccountBalance(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	accountID, err := ledger.ParseAccountID(id)
+	accountID, err := account.ParseAccountID(id)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_account_id", err.Error())
 		return
 	}
-
 	acct, err := h.accounts.FindByID(r.Context(), accountID)
 	if errors.Is(err, account.ErrAccountNotFound) {
 		writeError(w, http.StatusNotFound, "account_not_found", "account not found")
@@ -137,13 +125,11 @@ func (h *Handler) GetAccountBalance(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 		return
 	}
-
-	balance, err := h.ledgerRepo.GetBalance(r.Context(), accountID, acct.Currency)
+	balance, err := h.balances.GetBalance(r.Context(), accountID, acct.Currency)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 		return
 	}
-
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"account_id": id,
 		"balance":    balance.Amount,
@@ -153,7 +139,7 @@ func (h *Handler) GetAccountBalance(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleDomainError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, transfer.ErrInsufficientFunds):
+	case errors.Is(err, money.ErrInsufficientFunds):
 		writeError(w, http.StatusUnprocessableEntity, "insufficient_funds", err.Error())
 	case errors.Is(err, transfer.ErrIdempotencyKeyReused):
 		writeError(w, http.StatusUnprocessableEntity, "idempotency_key_reused_with_different_payload", err.Error())

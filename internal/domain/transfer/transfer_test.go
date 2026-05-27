@@ -3,16 +3,17 @@ package transfer_test
 import (
 	"testing"
 
-	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/ledger"
+	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/account"
+	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/money"
 	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/transfer"
 )
 
-func validTransfer(t *testing.T) *transfer.Transfer {
+func newValidTransfer(t *testing.T) *transfer.Transfer {
 	t.Helper()
-	src := ledger.NewAccountID()
-	dst := ledger.NewAccountID()
-	amount := ledger.MustMoney(10_000, ledger.CurrencyIDR)
-	tx, err := transfer.New(transfer.NewTransferID(), "key-"+newUUID(), src, dst, amount)
+	src := account.NewAccountID()
+	dst := account.NewAccountID()
+	amount := money.Must(10_000, money.CurrencyIDR)
+	tx, err := transfer.New(transfer.NewTransferID(), "key-"+transfer.NewTransferID().String(), src, dst, amount)
 	if err != nil {
 		t.Fatalf("create transfer: %v", err)
 	}
@@ -20,70 +21,57 @@ func validTransfer(t *testing.T) *transfer.Transfer {
 }
 
 func TestTransfer_StateMachine_HappyPath(t *testing.T) {
-	tx := validTransfer(t)
-
-	steps := []transfer.State{
-		transfer.StateDebited,
-		transfer.StateBankCalled,
-		transfer.StateCredited,
-		transfer.StateCompleted,
-	}
-
-	for _, next := range steps {
+	tx := newValidTransfer(t)
+	for _, next := range []transfer.State{
+		transfer.StateDebited, transfer.StateBankCalled,
+		transfer.StateCredited, transfer.StateCompleted,
+	} {
 		if err := tx.Transition(next); err != nil {
 			t.Fatalf("transition to %s failed: %v", next, err)
 		}
-		if tx.State != next {
-			t.Errorf("want %s, got %s", next, tx.State)
-		}
+	}
+	if tx.State != transfer.StateCompleted {
+		t.Errorf("want COMPLETED, got %s", tx.State)
 	}
 }
 
-func TestTransfer_StateMachine_InvalidTransition(t *testing.T) {
-	tx := validTransfer(t)
-	// PENDING → COMPLETED is not a valid single-hop transition.
+func TestTransfer_InvalidTransition_Rejected(t *testing.T) {
+	tx := newValidTransfer(t)
+	// PENDING → COMPLETED skips steps — must be rejected.
 	if err := tx.Transition(transfer.StateCompleted); err == nil {
-		t.Error("expected error for invalid transition PENDING → COMPLETED")
+		t.Error("expected error for illegal transition PENDING → COMPLETED")
 	}
 }
 
-func TestTransfer_StateMachine_TerminalStateBlocked(t *testing.T) {
-	tx := validTransfer(t)
+func TestTransfer_TerminalState_CannotTransition(t *testing.T) {
+	tx := newValidTransfer(t)
 	tx.Transition(transfer.StateFailed) //nolint:errcheck
 	if err := tx.Transition(transfer.StatePending); err == nil {
-		t.Error("expected error: terminal state FAILED must not be exited")
+		t.Error("terminal state FAILED must not allow outgoing transitions")
 	}
 }
 
 func TestTransfer_ZeroAmount_Rejected(t *testing.T) {
-	src := ledger.NewAccountID()
-	dst := ledger.NewAccountID()
-	zero := ledger.Money{Amount: 0, Currency: ledger.CurrencyIDR}
-	_, err := transfer.New(transfer.NewTransferID(), "key", src, dst, zero)
+	src, dst := account.NewAccountID(), account.NewAccountID()
+	_, err := transfer.New(transfer.NewTransferID(), "key", src, dst, money.Money{Amount: 0, Currency: money.CurrencyIDR})
 	if err == nil {
 		t.Error("zero amount should be rejected")
 	}
 }
 
-func TestTransfer_NoIdempotencyKey_Rejected(t *testing.T) {
-	src := ledger.NewAccountID()
-	dst := ledger.NewAccountID()
-	amount := ledger.MustMoney(1000, ledger.CurrencyIDR)
-	_, err := transfer.New(transfer.NewTransferID(), "", src, dst, amount)
+func TestTransfer_EmptyIdempotencyKey_Rejected(t *testing.T) {
+	src, dst := account.NewAccountID(), account.NewAccountID()
+	_, err := transfer.New(transfer.NewTransferID(), "", src, dst, money.Must(1000, money.CurrencyIDR))
 	if err == nil {
 		t.Error("empty idempotency key should be rejected")
 	}
 }
 
 func TestTransfer_VersionIncrementsOnTransition(t *testing.T) {
-	tx := validTransfer(t)
-	initialVersion := tx.Version
+	tx := newValidTransfer(t)
+	v := tx.Version
 	tx.Transition(transfer.StateDebited) //nolint:errcheck
-	if tx.Version != initialVersion+1 {
-		t.Errorf("version should increment on state change: want %d, got %d", initialVersion+1, tx.Version)
+	if tx.Version != v+1 {
+		t.Errorf("version should increment: want %d, got %d", v+1, tx.Version)
 	}
-}
-
-func newUUID() string {
-	return transfer.NewTransferID().String()
 }

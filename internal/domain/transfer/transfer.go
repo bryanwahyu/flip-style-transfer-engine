@@ -1,29 +1,33 @@
+// Package transfer owns the Transfer aggregate — the core business concept of
+// moving money between two accounts. It deliberately does NOT import the ledger
+// package: how funds are tracked in the ledger is an application-layer concern,
+// not a transfer domain concern.
 package transfer
 
 import (
 	"fmt"
 	"time"
 
-	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/ledger"
+	"github.com/google/uuid"
+
+	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/account"
+	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/money"
 )
 
-// TransferID is a typed identifier for a transfer aggregate.
-type TransferID struct{ id string }
+// TransferID is the typed identity of a transfer aggregate.
+type TransferID struct{ uuid.UUID }
 
-func NewTransferID() TransferID {
-	return TransferID{id: newUUID()}
-}
-
+func NewTransferID() TransferID { return TransferID{uuid.New()} }
+func (t TransferID) String() string { return t.UUID.String() }
 func ParseTransferID(s string) (TransferID, error) {
-	if err := validateUUID(s); err != nil {
+	id, err := uuid.Parse(s)
+	if err != nil {
 		return TransferID{}, fmt.Errorf("invalid transfer ID %q: %w", s, err)
 	}
-	return TransferID{id: s}, nil
+	return TransferID{id}, nil
 }
 
-func (t TransferID) String() string { return t.id }
-
-// State represents the lifecycle state of a Transfer.
+// State is the lifecycle state of a Transfer.
 type State string
 
 const (
@@ -36,42 +40,27 @@ const (
 	StateCompensating State = "COMPENSATING"
 )
 
-// Transfer is the aggregate root for a money transfer between two accounts.
+// Transfer is the aggregate root. It owns the state machine and all invariants
+// for a single money-movement request.
 type Transfer struct {
 	ID              TransferID
 	IdempotencyKey  string
-	SourceAccountID ledger.AccountID
-	DestAccountID   ledger.AccountID
-	Amount          ledger.Money
+	SourceAccountID account.AccountID
+	DestAccountID   account.AccountID
+	Amount          money.Money
 	State           State
-	ExternalRef     string // reference returned by the bank gateway
+	ExternalRef     string
 	FailureReason   string
-	DebitTxID       ledger.TransactionID // set after ReserveDebit
-	CreditTxID      ledger.TransactionID // set after PostCredit
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
-	Version         int // optimistic concurrency counter
-}
-
-// Transition advances the state machine, returning ErrInvalidStateTransition if illegal.
-func (t *Transfer) Transition(next State) error {
-	allowed, ok := validTransitions[t.State]
-	if !ok {
-		return fmt.Errorf("%w: no transitions defined from %s", ErrInvalidStateTransition, t.State)
-	}
-	for _, v := range allowed {
-		if v == next {
-			t.State = next
-			t.UpdatedAt = time.Now().UTC()
-			t.Version++
-			return nil
-		}
-	}
-	return fmt.Errorf("%w: %s → %s is not allowed", ErrInvalidStateTransition, t.State, next)
+	// Flags track which ledger legs were posted so compensation knows what to reverse.
+	DebitPosted  bool
+	CreditPosted bool
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+	Version      int
 }
 
 // validTransitions encodes the complete state machine.
-// Any state not listed as a key is terminal.
+// Any state absent from this map is terminal.
 var validTransitions = map[State][]State{
 	StatePending:      {StateDebited, StateFailed},
 	StateDebited:      {StateBankCalled, StateCompensating},
@@ -80,15 +69,26 @@ var validTransitions = map[State][]State{
 	StateCompensating: {StateFailed},
 }
 
-// New creates a new Transfer in PENDING state.
-func New(
-	id TransferID,
-	idempotencyKey string,
-	src, dst ledger.AccountID,
-	amount ledger.Money,
-) (*Transfer, error) {
+// Transition advances the state machine, returning ErrInvalidStateTransition for illegal moves.
+func (t *Transfer) Transition(next State) error {
+	for _, allowed := range validTransitions[t.State] {
+		if allowed == next {
+			t.State = next
+			t.UpdatedAt = time.Now().UTC()
+			t.Version++
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %s → %s", ErrInvalidStateTransition, t.State, next)
+}
+
+// New creates a Transfer in PENDING state.
+func New(id TransferID, idempotencyKey string, src, dst account.AccountID, amount money.Money) (*Transfer, error) {
+	if idempotencyKey == "" {
+		return nil, ErrIdempotencyKeyRequired
+	}
 	if err := amount.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid transfer amount: %w", err)
+		return nil, fmt.Errorf("invalid amount: %w", err)
 	}
 	if amount.IsZero() {
 		return nil, fmt.Errorf("transfer amount must be non-zero")
@@ -96,20 +96,12 @@ func New(
 	if src == dst {
 		return nil, fmt.Errorf("source and destination accounts must differ")
 	}
-	if idempotencyKey == "" {
-		return nil, ErrIdempotencyKeyRequired
-	}
 
 	now := time.Now().UTC()
 	return &Transfer{
-		ID:              id,
-		IdempotencyKey:  idempotencyKey,
-		SourceAccountID: src,
-		DestAccountID:   dst,
-		Amount:          amount,
-		State:           StatePending,
-		CreatedAt:       now,
-		UpdatedAt:       now,
-		Version:         1,
+		ID: id, IdempotencyKey: idempotencyKey,
+		SourceAccountID: src, DestAccountID: dst,
+		Amount: amount, State: StatePending,
+		CreatedAt: now, UpdatedAt: now, Version: 1,
 	}, nil
 }

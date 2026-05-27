@@ -13,8 +13,11 @@ CREATE TABLE IF NOT EXISTS transfers (
                                   )),
     external_ref      TEXT        NOT NULL DEFAULT '',
     failure_reason    TEXT        NOT NULL DEFAULT '',
-    debit_tx_id       UUID,
-    credit_tx_id      UUID,
+    -- Simple boolean flags instead of transaction IDs.
+    -- The saga needs to know what to reverse on compensation; the State column
+    -- already tells us the order, and these flags confirm what was committed.
+    debit_posted      BOOLEAN     NOT NULL DEFAULT FALSE,
+    credit_posted     BOOLEAN     NOT NULL DEFAULT FALSE,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     version           INT         NOT NULL DEFAULT 1

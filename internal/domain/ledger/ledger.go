@@ -3,21 +3,23 @@ package ledger
 import (
 	"fmt"
 	"time"
+
+	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/account"
+	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/money"
 )
 
-// Posting is a validated double-entry pair: one debit and one credit that sum to zero.
-// Callers must use NewPosting — never construct directly.
+// Posting is a validated double-entry pair: one debit and one credit summing to zero.
+// Construct only via NewPosting — never build directly.
 type Posting struct {
 	TransactionID TransactionID
 	Debit         LedgerEntry
 	Credit        LedgerEntry
 }
 
-// NewPosting constructs a balanced double-entry posting.
-// src account is debited (money leaves), dst account is credited (money arrives).
-func NewPosting(txID TransactionID, src, dst AccountID, amount Money, description string) (Posting, error) {
+// NewPosting creates a balanced posting: src is debited, dst is credited.
+func NewPosting(txID TransactionID, src, dst account.AccountID, amount money.Money, description string) (Posting, error) {
 	if err := amount.Validate(); err != nil {
-		return Posting{}, fmt.Errorf("invalid posting amount: %w", err)
+		return Posting{}, fmt.Errorf("posting amount invalid: %w", err)
 	}
 	if amount.IsZero() {
 		return Posting{}, fmt.Errorf("posting amount must be non-zero")
@@ -28,49 +30,33 @@ func NewPosting(txID TransactionID, src, dst AccountID, amount Money, descriptio
 
 	now := time.Now().UTC()
 	debit := LedgerEntry{
-		ID:            NewLedgerEntryID(),
-		TransactionID: txID,
-		AccountID:     src,
-		Type:          EntryTypeDebit,
-		Amount:        amount,
-		Description:   description,
-		CreatedAt:     now,
+		ID: NewLedgerEntryID(), TransactionID: txID, AccountID: src,
+		Type: EntryTypeDebit, Amount: amount, Description: description, CreatedAt: now,
 	}
 	credit := LedgerEntry{
-		ID:            NewLedgerEntryID(),
-		TransactionID: txID,
-		AccountID:     dst,
-		Type:          EntryTypeCredit,
-		Amount:        amount,
-		Description:   description,
-		CreatedAt:     now,
+		ID: NewLedgerEntryID(), TransactionID: txID, AccountID: dst,
+		Type: EntryTypeCredit, Amount: amount, Description: description, CreatedAt: now,
 	}
 
-	// Invariant: debit + credit must sum to zero in signed representation.
+	// Invariant enforced at construction, not by discipline.
 	if debit.SignedAmount()+credit.SignedAmount() != 0 {
 		return Posting{}, ErrDoubleEntryViolation
 	}
 
-	return Posting{
-		TransactionID: txID,
-		Debit:         debit,
-		Credit:        credit,
-	}, nil
+	return Posting{TransactionID: txID, Debit: debit, Credit: credit}, nil
 }
 
 // Entries returns both ledger entries for persistence.
-func (p Posting) Entries() []LedgerEntry {
-	return []LedgerEntry{p.Debit, p.Credit}
-}
+func (p Posting) Entries() []LedgerEntry { return []LedgerEntry{p.Debit, p.Credit} }
 
-// ReversalPosting creates a reversing (compensating) posting for the original.
-// The original debit account becomes the credit, and vice versa.
-func (p Posting) ReversalPosting(newTxID TransactionID) (Posting, error) {
+// Reversal creates a compensating posting that undoes the original.
+// The original debit account is credited, and vice versa.
+func (p Posting) Reversal(newTxID TransactionID) (Posting, error) {
 	return NewPosting(
 		newTxID,
-		p.Credit.AccountID, // was credited → now debited to return the money
-		p.Debit.AccountID,  // was debited → now credited to restore the balance
+		p.Credit.AccountID, // was credited → now debited (returns the money)
+		p.Debit.AccountID,  // was debited → now credited (restores the balance)
 		p.Debit.Amount,
-		fmt.Sprintf("REVERSAL of %s", p.TransactionID.String()),
+		fmt.Sprintf("REVERSAL of tx %s", p.TransactionID.String()),
 	)
 }

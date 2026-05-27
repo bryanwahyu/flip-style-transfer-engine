@@ -3,10 +3,10 @@ package transfer
 import (
 	"time"
 
-	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/ledger"
+	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/money"
 )
 
-// EventType enumerates all transfer domain events published to the event bus.
+// EventType enumerates the domain events emitted during a transfer's lifecycle.
 type EventType string
 
 const (
@@ -16,7 +16,6 @@ const (
 	EventTransferCredited   EventType = "transfer.credited"
 	EventTransferCompleted  EventType = "transfer.completed"
 	EventTransferFailed     EventType = "transfer.failed"
-	EventTransferReversed   EventType = "transfer.reversed"
 )
 
 // TransferEvent is the envelope stored in transfer_events and published to NATS.
@@ -25,14 +24,14 @@ type TransferEvent struct {
 	TransferID TransferID
 	Type       EventType
 	State      State
-	Amount     ledger.Money
+	Amount     money.Money
 	OccurredAt time.Time
 	Metadata   map[string]string
 }
 
 func NewEvent(t *Transfer, typ EventType) TransferEvent {
 	return TransferEvent{
-		EventID:    newUUID(),
+		EventID:    NewTransferID().String(), // reuse ID generation for simplicity
 		TransferID: t.ID,
 		Type:       typ,
 		State:      t.State,

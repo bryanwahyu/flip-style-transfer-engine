@@ -34,75 +34,64 @@ func run(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	dbURL := envOrDefault("DATABASE_URL", "postgres://flip:flip@localhost:5432/flip?sslmode=disable")
-	natsURL := envOrDefault("NATS_URL", "nats://localhost:4222")
-
-	db, err := pgxpool.New(ctx, dbURL)
+	db, err := pgxpool.New(ctx, envOrDefault("DATABASE_URL", "postgres://flip:flip@localhost:5432/flip?sslmode=disable"))
 	if err != nil {
-		return fmt.Errorf("connect to postgres: %w", err)
+		return fmt.Errorf("connect postgres: %w", err)
 	}
 	defer db.Close()
 
-	nc, err := nats.Connect(natsURL)
+	nc, err := nats.Connect(envOrDefault("NATS_URL", "nats://localhost:4222"))
 	if err != nil {
-		return fmt.Errorf("connect to nats: %w", err)
+		return fmt.Errorf("connect nats: %w", err)
 	}
 	defer nc.Drain() //nolint:errcheck
 
 	transferRepo := pgpkg.NewTransferRepo(db)
 	ledgerRepo := pgpkg.NewLedgerRepo(db)
 	accountRepo := pgpkg.NewAccountRepo(db)
-	outboxWriter := pgpkg.NewOutboxWriter(db)
-	eventStore := pgpkg.NewEventStore(db)
 
-	// Bank gateway with circuit breaker: open after 5 consecutive failures, reset after 30s.
-	mockBank := bankmock.New(bankmock.ModeSuccess)
+	bank := bankmock.New(bankmock.ModeSuccess)
 	cb := circuitbreaker.New(5, 30*time.Second)
-	bankGateway := bankmock.NewCircuitBreakerGateway(mockBank, cb)
+	bankGW := bankmock.NewCircuitBreakerGateway(bank, cb)
 
 	transferSaga := saga.NewTransferSaga(
-		transferRepo, ledgerRepo, accountRepo,
-		bankGateway, outboxWriter, eventStore, log,
+		transferRepo,
+		ledgerRepo, // EntryWriter
+		ledgerRepo, // BalanceReader
+		accountRepo,
+		bankGW,
+		pgpkg.NewOutboxWriter(db),
+		pgpkg.NewEventStore(db),
+		log,
 	)
 
 	consumer, err := natspkg.NewConsumer(nc, "TRANSFERS", "worker", log)
 	if err != nil {
-		return fmt.Errorf("create nats consumer: %w", err)
+		return fmt.Errorf("create consumer: %w", err)
 	}
 
 	subjects := []string{
-		"transfer.requested",
-		"transfer.debited",
-		"transfer.bank_called",
-		"transfer.credited",
+		"transfer.requested", "transfer.debited",
+		"transfer.bank_called", "transfer.credited",
 	}
 	if err := consumer.EnsureStream(ctx, subjects); err != nil {
 		return fmt.Errorf("ensure stream: %w", err)
 	}
 
-	log.Info("worker started, subscribing to transfer events")
+	log.Info("worker started")
 
-	return consumer.Subscribe(ctx, func(ctx context.Context, subject string, data []byte) error {
+	return consumer.Subscribe(ctx, func(ctx context.Context, _ string, data []byte) error {
 		var msg struct {
 			TransferID string `json:"transfer_id"`
 		}
 		if err := json.Unmarshal(data, &msg); err != nil {
 			return fmt.Errorf("unmarshal message: %w", err)
 		}
-
-		transferID, err := transfer.ParseTransferID(msg.TransferID)
+		id, err := transfer.ParseTransferID(msg.TransferID)
 		if err != nil {
 			return fmt.Errorf("parse transfer id: %w", err)
 		}
-
-		log := log.With("transfer_id", transferID.String(), "subject", subject)
-		log.Info("worker: processing saga step")
-
-		if err := transferSaga.Execute(ctx, transferID); err != nil {
-			log.Error("worker: saga execution failed", "error", err)
-			return err
-		}
-		return nil
+		return transferSaga.Execute(ctx, id)
 	})
 }
 

@@ -11,9 +11,16 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/ledger"
 	"github.com/bryanwahyu/flip-style-transfer-engine/internal/infrastructure/observability"
 	pgpkg "github.com/bryanwahyu/flip-style-transfer-engine/internal/infrastructure/postgres"
 )
+
+// ledgerAuditor is a local interface defining exactly what the reconciler needs.
+// Following DIP: the reconciler depends on an abstraction, not a concrete type.
+type ledgerAuditor interface {
+	GetAllEntries(ctx context.Context) ([]ledger.LedgerEntry, error)
+}
 
 func main() {
 	log := observability.NewLogger()
@@ -27,17 +34,14 @@ func run(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	dbURL := envOrDefault("DATABASE_URL", "postgres://flip:flip@localhost:5432/flip?sslmode=disable")
-	interval := 60 * time.Second
-
-	db, err := pgxpool.New(ctx, dbURL)
+	db, err := pgxpool.New(ctx, envOrDefault("DATABASE_URL", "postgres://flip:flip@localhost:5432/flip?sslmode=disable"))
 	if err != nil {
-		return fmt.Errorf("connect to postgres: %w", err)
+		return fmt.Errorf("connect postgres: %w", err)
 	}
 	defer db.Close()
 
-	ledgerRepo := pgpkg.NewLedgerRepo(db)
-
+	auditor := pgpkg.NewLedgerRepo(db) // satisfies ledgerAuditor interface
+	interval := 60 * time.Second
 	log.Info("reconciler started", "interval_s", interval.Seconds())
 
 	ticker := time.NewTicker(interval)
@@ -48,7 +52,7 @@ func run(log *slog.Logger) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if err := reconcile(ctx, ledgerRepo, log); err != nil {
+			if err := reconcile(ctx, auditor, log); err != nil {
 				log.Error("reconciliation error", "error", err)
 			}
 		}
@@ -56,14 +60,12 @@ func run(log *slog.Logger) error {
 }
 
 // reconcile checks that the sum of all ledger entries equals zero (double-entry invariant).
-// Any drift indicates a bug in posting logic and is flagged as a critical alert.
-func reconcile(ctx context.Context, ledger *pgpkg.LedgerRepo, log *slog.Logger) error {
-	entries, err := ledger.GetAllEntries(ctx)
+func reconcile(ctx context.Context, auditor ledgerAuditor, log *slog.Logger) error {
+	entries, err := auditor.GetAllEntries(ctx)
 	if err != nil {
 		return fmt.Errorf("load ledger entries: %w", err)
 	}
 
-	// Group signed balances by currency.
 	totals := make(map[string]int64)
 	for _, e := range entries {
 		totals[string(e.Amount.Currency)] += e.SignedAmount()
@@ -84,7 +86,6 @@ func reconcile(ctx context.Context, ledger *pgpkg.LedgerRepo, log *slog.Logger) 
 	if !drift {
 		log.Info("reconciliation OK", "entries_checked", len(entries))
 	}
-
 	return nil
 }
 

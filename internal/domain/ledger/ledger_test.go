@@ -3,13 +3,15 @@ package ledger_test
 import (
 	"testing"
 
+	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/account"
 	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/ledger"
+	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/money"
 )
 
 func TestNewPosting_DoubleEntry(t *testing.T) {
-	src := ledger.NewAccountID()
-	dst := ledger.NewAccountID()
-	amount := ledger.MustMoney(100_000, ledger.CurrencyIDR)
+	src := account.NewAccountID()
+	dst := account.NewAccountID()
+	amount := money.Must(100_000, money.CurrencyIDR)
 	txID := ledger.NewTransactionID()
 
 	posting, err := ledger.NewPosting(txID, src, dst, amount, "test posting")
@@ -32,28 +34,26 @@ func TestNewPosting_DoubleEntry(t *testing.T) {
 }
 
 func TestNewPosting_SameAccountReturnsError(t *testing.T) {
-	id := ledger.NewAccountID()
-	amount := ledger.MustMoney(100, ledger.CurrencyIDR)
+	id := account.NewAccountID()
+	amount := money.Must(100, money.CurrencyIDR)
 	_, err := ledger.NewPosting(ledger.NewTransactionID(), id, id, amount, "self-transfer")
 	if err == nil {
-		t.Error("expected error for same source and destination account")
+		t.Error("expected error for same source and destination")
 	}
 }
 
 func TestNewPosting_ZeroAmountReturnsError(t *testing.T) {
-	src := ledger.NewAccountID()
-	dst := ledger.NewAccountID()
-	zero := ledger.Money{Amount: 0, Currency: ledger.CurrencyIDR}
-	_, err := ledger.NewPosting(ledger.NewTransactionID(), src, dst, zero, "zero amount")
+	src, dst := account.NewAccountID(), account.NewAccountID()
+	zero := money.Money{Amount: 0, Currency: money.CurrencyIDR}
+	_, err := ledger.NewPosting(ledger.NewTransactionID(), src, dst, zero, "zero")
 	if err == nil {
-		t.Error("expected error for zero amount posting")
+		t.Error("expected error for zero amount")
 	}
 }
 
-func TestPosting_Reversal(t *testing.T) {
-	src := ledger.NewAccountID()
-	dst := ledger.NewAccountID()
-	amount := ledger.MustMoney(50_000, ledger.CurrencyIDR)
+func TestPosting_Reversal_SwapsAccounts(t *testing.T) {
+	src, dst := account.NewAccountID(), account.NewAccountID()
+	amount := money.Must(50_000, money.CurrencyIDR)
 	txID := ledger.NewTransactionID()
 
 	original, err := ledger.NewPosting(txID, src, dst, amount, "original")
@@ -61,18 +61,15 @@ func TestPosting_Reversal(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	reversal, err := original.ReversalPosting(ledger.NewTransactionID())
+	reversal, err := original.Reversal(ledger.NewTransactionID())
 	if err != nil {
 		t.Fatalf("reversal error: %v", err)
 	}
 
-	// In the reversal, debit and credit accounts should be swapped.
 	if reversal.Debit.AccountID != dst {
-		t.Errorf("reversal debit should be original credit account (%s), got %s",
-			dst.String(), reversal.Debit.AccountID.String())
+		t.Errorf("reversal debit should be original credit account %s, got %s", dst, reversal.Debit.AccountID)
 	}
 	if reversal.Credit.AccountID != src {
-		t.Errorf("reversal credit should be original debit account (%s), got %s",
-			src.String(), reversal.Credit.AccountID.String())
+		t.Errorf("reversal credit should be original debit account %s, got %s", src, reversal.Credit.AccountID)
 	}
 }

@@ -1,3 +1,9 @@
+// Package saga contains the TransferSaga orchestrator.
+//
+// Design: each saga step is a named function registered in a map keyed by the
+// state the transfer is in when that step should run.  Execute() is purely a
+// dispatcher — it contains zero business logic, satisfying OCP: adding a new
+// step only requires adding a new entry to the map, never modifying Execute().
 package saga
 
 import (
@@ -8,134 +14,146 @@ import (
 	"time"
 
 	"github.com/bryanwahyu/flip-style-transfer-engine/internal/application/port"
+	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/account"
 	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/ledger"
+	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/money"
 	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/transfer"
 )
 
+// stepFn is the signature every saga step must satisfy.
+type stepFn func(ctx context.Context, t *transfer.Transfer) error
+
+// step pairs a forward action with its compensating action.
+type step struct {
+	execute    stepFn
+	compensate stepFn // nil if this step has no compensation (e.g. bank call)
+}
+
+// deps groups the saga's infrastructure dependencies.
+type deps struct {
+	transfers port.TransferRepository
+	entries   port.EntryWriter
+	balances  port.BalanceReader
+	accounts  port.AccountLocker
+	bank      port.BankGateway
+	outbox    port.OutboxWriter
+	events    port.TransferEventStore
+}
+
 // TransferSaga orchestrates the multi-step transfer lifecycle.
-//
-// Happy path:  PENDING → ReserveDebit → DEBITED → CallBank → BANK_CALLED → PostCredit → CREDITED → COMPLETED
-// Compensation: on any step failure, reverse in opposite order back to FAILED.
-//
-// Every step is idempotent: re-executing a step that already completed is a no-op.
+// It is stateless — the transfer's State column in the DB is the authoritative
+// resume point after a crash.
 type TransferSaga struct {
-	transfers  port.TransferRepository
-	ledger     port.LedgerRepository
-	accounts   port.AccountRepository
-	bank       port.BankGateway
-	outbox     port.OutboxWriter
-	events     port.TransferEventStore
-	log        *slog.Logger
+	deps
+	log   *slog.Logger
+	steps map[transfer.State]step
 }
 
 func NewTransferSaga(
 	transfers port.TransferRepository,
-	ledger port.LedgerRepository,
-	accounts port.AccountRepository,
+	entries port.EntryWriter,
+	balances port.BalanceReader,
+	accounts port.AccountLocker,
 	bank port.BankGateway,
 	outbox port.OutboxWriter,
 	events port.TransferEventStore,
 	log *slog.Logger,
 ) *TransferSaga {
-	return &TransferSaga{
-		transfers: transfers,
-		ledger:    ledger,
-		accounts:  accounts,
-		bank:      bank,
-		outbox:    outbox,
-		events:    events,
-		log:       log,
+	s := &TransferSaga{
+		deps: deps{
+			transfers: transfers, entries: entries, balances: balances,
+			accounts: accounts, bank: bank, outbox: outbox, events: events,
+		},
+		log: log,
 	}
+
+	// Step map: state → {forward, compensate}.
+	// Terminal states (COMPLETED, FAILED) are absent — Execute returns nil for them.
+	s.steps = map[transfer.State]step{
+		transfer.StatePending:      {s.reserveDebit, s.reverseDebit},
+		transfer.StateDebited:      {s.callBank, nil},
+		transfer.StateBankCalled:   {s.postCredit, s.reverseCredit},
+		transfer.StateCredited:     {s.complete, nil},
+		transfer.StateCompensating: {s.compensate, nil},
+	}
+
+	return s
 }
 
-// Execute resumes the saga from wherever the transfer currently sits.
-// It is safe to call Execute multiple times for the same transfer (idempotent).
-func (s *TransferSaga) Execute(ctx context.Context, transferID transfer.TransferID) error {
-	t, err := s.transfers.FindByID(ctx, transferID)
+// Execute resumes the saga from the transfer's current state.
+// Safe to call multiple times for the same transfer (idempotent).
+func (s *TransferSaga) Execute(ctx context.Context, id transfer.TransferID) error {
+	t, err := s.transfers.FindByID(ctx, id)
 	if err != nil {
 		return fmt.Errorf("load transfer: %w", err)
 	}
 
-	log := s.log.With("transfer_id", t.ID.String(), "state", string(t.State))
-
-	switch t.State {
-	case transfer.StatePending:
-		return s.reserveDebit(ctx, t, log)
-	case transfer.StateDebited:
-		return s.callBank(ctx, t, log)
-	case transfer.StateBankCalled:
-		return s.postCredit(ctx, t, log)
-	case transfer.StateCredited:
-		return s.completeTransfer(ctx, t, log)
-	case transfer.StateCompleted, transfer.StateFailed:
-		return nil // terminal states, nothing to do
-	case transfer.StateCompensating:
-		return s.compensate(ctx, t, log)
-	default:
-		return fmt.Errorf("unhandled transfer state: %s", t.State)
+	st, ok := s.steps[t.State]
+	if !ok {
+		return nil // terminal state — nothing to do
 	}
+
+	return st.execute(ctx, t)
 }
 
-// reserveDebit debits the source account and records the ledger entry atomically.
-// PENDING → DEBITED
-func (s *TransferSaga) reserveDebit(ctx context.Context, t *transfer.Transfer, log *slog.Logger) error {
-	log.Info("saga: reserving debit")
+// ── Step implementations ──────────────────────────────────────────────────────
+
+func (s *TransferSaga) reserveDebit(ctx context.Context, t *transfer.Transfer) error {
+	log := s.log.With("transfer_id", t.ID.String(), "step", "reserve_debit")
 
 	src, err := s.accounts.LockForUpdate(ctx, t.SourceAccountID)
 	if err != nil {
 		return fmt.Errorf("lock source account: %w", err)
 	}
 	if err := src.CanTransact(); err != nil {
-		return s.fail(ctx, t, err.Error(), log)
+		return s.failWith(ctx, t, err.Error())
 	}
 
-	balance, err := s.ledger.GetBalance(ctx, t.SourceAccountID, t.Amount.Currency)
+	balance, err := s.balances.GetBalance(ctx, t.SourceAccountID, t.Amount.Currency)
 	if err != nil {
 		return fmt.Errorf("get balance: %w", err)
 	}
 	if balance.Amount < t.Amount.Amount {
-		return s.fail(ctx, t, "insufficient funds", log)
+		return s.failWith(ctx, t, money.ErrInsufficientFunds.Error())
 	}
 
-	// Use a clearing account (FLOAT) as the interim destination for the debit leg.
-	floatAccountID := floatAccount(t.Amount.Currency)
-	txID := ledger.NewTransactionID()
-	posting, err := ledger.NewPosting(txID, t.SourceAccountID, floatAccountID, t.Amount,
-		fmt.Sprintf("debit reserve for transfer %s", t.ID.String()))
+	floatID := account.FloatAccounts[t.Amount.Currency]
+	posting, err := ledger.NewPosting(
+		ledger.NewTransactionID(), t.SourceAccountID, floatID, t.Amount,
+		fmt.Sprintf("debit reserve transfer/%s", t.ID.String()),
+	)
 	if err != nil {
-		return fmt.Errorf("create debit posting: %w", err)
+		return fmt.Errorf("build debit posting: %w", err)
 	}
-
-	if err := s.ledger.PostEntries(ctx, posting.Entries()); err != nil {
+	if err := s.entries.PostEntries(ctx, posting.Entries()); err != nil {
 		return fmt.Errorf("post debit entries: %w", err)
 	}
 
-	t.DebitTxID = txID
+	t.DebitPosted = true
 	if err := t.Transition(transfer.StateDebited); err != nil {
 		return err
 	}
 	if err := s.transfers.UpdateState(ctx, t); err != nil {
-		return fmt.Errorf("update transfer state: %w", err)
+		return fmt.Errorf("update state: %w", err)
 	}
 
-	return s.appendAndPublish(ctx, t, transfer.EventTransferDebited, log)
+	log.Info("debit reserved")
+	return s.publishEvent(ctx, t, transfer.EventTransferDebited)
 }
 
-// callBank sends the transfer request to the external bank gateway.
-// DEBITED → BANK_CALLED
-func (s *TransferSaga) callBank(ctx context.Context, t *transfer.Transfer, log *slog.Logger) error {
-	log.Info("saga: calling bank")
+func (s *TransferSaga) callBank(ctx context.Context, t *transfer.Transfer) error {
+	log := s.log.With("transfer_id", t.ID.String(), "step", "call_bank")
 
 	result, err := s.bank.InitiateTransfer(ctx, port.BankCallRequest{
 		TransferID:      t.ID,
 		SourceAccountID: t.SourceAccountID,
 		DestAccountID:   t.DestAccountID,
 		Amount:          t.Amount,
-		Description:     fmt.Sprintf("transfer %s", t.ID.String()),
+		Description:     fmt.Sprintf("transfer/%s", t.ID.String()),
 	})
 	if err != nil {
-		log.Warn("saga: bank call failed, compensating", "error", err)
-		return s.startCompensation(ctx, t, err.Error(), log)
+		log.Warn("bank call failed", "error", err)
+		return s.startCompensation(ctx, t, err.Error())
 	}
 
 	t.ExternalRef = result.ExternalRef
@@ -143,155 +161,141 @@ func (s *TransferSaga) callBank(ctx context.Context, t *transfer.Transfer, log *
 		return err
 	}
 	if err := s.transfers.UpdateState(ctx, t); err != nil {
-		return fmt.Errorf("update transfer state: %w", err)
+		return fmt.Errorf("update state: %w", err)
 	}
 
-	return s.appendAndPublish(ctx, t, transfer.EventTransferBankCalled, log)
+	log.Info("bank acknowledged", "external_ref", result.ExternalRef)
+	return s.publishEvent(ctx, t, transfer.EventTransferBankCalled)
 }
 
-// postCredit credits the destination account.
-// BANK_CALLED → CREDITED
-func (s *TransferSaga) postCredit(ctx context.Context, t *transfer.Transfer, log *slog.Logger) error {
-	log.Info("saga: posting credit")
+func (s *TransferSaga) postCredit(ctx context.Context, t *transfer.Transfer) error {
+	log := s.log.With("transfer_id", t.ID.String(), "step", "post_credit")
 
-	floatAccountID := floatAccount(t.Amount.Currency)
-	txID := ledger.NewTransactionID()
-	posting, err := ledger.NewPosting(txID, floatAccountID, t.DestAccountID, t.Amount,
-		fmt.Sprintf("credit for transfer %s", t.ID.String()))
+	floatID := account.FloatAccounts[t.Amount.Currency]
+	posting, err := ledger.NewPosting(
+		ledger.NewTransactionID(), floatID, t.DestAccountID, t.Amount,
+		fmt.Sprintf("credit transfer/%s", t.ID.String()),
+	)
 	if err != nil {
-		return fmt.Errorf("create credit posting: %w", err)
+		return fmt.Errorf("build credit posting: %w", err)
 	}
-
-	if err := s.ledger.PostEntries(ctx, posting.Entries()); err != nil {
+	if err := s.entries.PostEntries(ctx, posting.Entries()); err != nil {
 		return fmt.Errorf("post credit entries: %w", err)
 	}
 
-	t.CreditTxID = txID
+	t.CreditPosted = true
 	if err := t.Transition(transfer.StateCredited); err != nil {
 		return err
 	}
 	if err := s.transfers.UpdateState(ctx, t); err != nil {
-		return fmt.Errorf("update transfer state: %w", err)
+		return fmt.Errorf("update state: %w", err)
 	}
 
-	return s.appendAndPublish(ctx, t, transfer.EventTransferCredited, log)
+	log.Info("credit posted")
+	return s.publishEvent(ctx, t, transfer.EventTransferCredited)
 }
 
-// completeTransfer marks the transfer as done.
-// CREDITED → COMPLETED
-func (s *TransferSaga) completeTransfer(ctx context.Context, t *transfer.Transfer, log *slog.Logger) error {
-	log.Info("saga: completing transfer")
-
+func (s *TransferSaga) complete(ctx context.Context, t *transfer.Transfer) error {
 	if err := t.Transition(transfer.StateCompleted); err != nil {
 		return err
 	}
 	if err := s.transfers.UpdateState(ctx, t); err != nil {
-		return fmt.Errorf("update transfer state: %w", err)
+		return fmt.Errorf("update state: %w", err)
 	}
-
-	return s.appendAndPublish(ctx, t, transfer.EventTransferCompleted, log)
+	s.log.Info("transfer completed", "transfer_id", t.ID.String())
+	return s.publishEvent(ctx, t, transfer.EventTransferCompleted)
 }
 
-// startCompensation transitions to COMPENSATING and kicks off reversal.
-func (s *TransferSaga) startCompensation(ctx context.Context, t *transfer.Transfer, reason string, log *slog.Logger) error {
+// ── Compensation ─────────────────────────────────────────────────────────────
+
+func (s *TransferSaga) startCompensation(ctx context.Context, t *transfer.Transfer, reason string) error {
 	t.FailureReason = reason
 	if err := t.Transition(transfer.StateCompensating); err != nil {
 		return err
 	}
 	if err := s.transfers.UpdateState(ctx, t); err != nil {
-		return fmt.Errorf("update transfer state: %w", err)
+		return fmt.Errorf("update state: %w", err)
 	}
-	return s.compensate(ctx, t, log)
+	return s.compensate(ctx, t)
 }
 
-// compensate reverses any ledger entries that were posted before the failure.
-func (s *TransferSaga) compensate(ctx context.Context, t *transfer.Transfer, log *slog.Logger) error {
-	log.Info("saga: compensating", "reason", t.FailureReason)
+// compensate reverses posted ledger legs in reverse order (credit first, then debit).
+func (s *TransferSaga) compensate(ctx context.Context, t *transfer.Transfer) error {
+	log := s.log.With("transfer_id", t.ID.String(), "step", "compensate")
 
-	// Reverse credit leg if it was posted.
-	zeroTx := ledger.TransactionID{}
-	if t.CreditTxID != zeroTx {
-		floatAccountID := floatAccount(t.Amount.Currency)
-		reversalTxID := ledger.NewTransactionID()
-		// Reverse: dst → float (undo the credit)
-		posting, err := ledger.NewPosting(reversalTxID, t.DestAccountID, floatAccountID, t.Amount,
-			fmt.Sprintf("REVERSAL credit for transfer %s", t.ID.String()))
-		if err != nil {
-			return fmt.Errorf("create credit reversal: %w", err)
+	if t.CreditPosted {
+		if err := s.reverseCredit(ctx, t); err != nil {
+			return err
 		}
-		if err := s.ledger.PostEntries(ctx, posting.Entries()); err != nil {
-			return fmt.Errorf("post credit reversal: %w", err)
+	}
+	if t.DebitPosted {
+		if err := s.reverseDebit(ctx, t); err != nil {
+			return err
 		}
 	}
 
-	// Reverse debit leg if it was posted.
-	if t.DebitTxID != zeroTx {
-		floatAccountID := floatAccount(t.Amount.Currency)
-		reversalTxID := ledger.NewTransactionID()
-		// Reverse: float → src (undo the debit)
-		posting, err := ledger.NewPosting(reversalTxID, floatAccountID, t.SourceAccountID, t.Amount,
-			fmt.Sprintf("REVERSAL debit for transfer %s", t.ID.String()))
-		if err != nil {
-			return fmt.Errorf("create debit reversal: %w", err)
-		}
-		if err := s.ledger.PostEntries(ctx, posting.Entries()); err != nil {
-			return fmt.Errorf("post debit reversal: %w", err)
-		}
-	}
-
-	return s.fail(ctx, t, t.FailureReason, log)
+	log.Info("compensation complete")
+	return s.failWith(ctx, t, t.FailureReason)
 }
 
-func (s *TransferSaga) fail(ctx context.Context, t *transfer.Transfer, reason string, log *slog.Logger) error {
+func (s *TransferSaga) reverseDebit(ctx context.Context, t *transfer.Transfer) error {
+	floatID := account.FloatAccounts[t.Amount.Currency]
+	// Reversal: float → src (returns the reserved funds)
+	posting, err := ledger.NewPosting(
+		ledger.NewTransactionID(), floatID, t.SourceAccountID, t.Amount,
+		fmt.Sprintf("REVERSAL debit transfer/%s", t.ID.String()),
+	)
+	if err != nil {
+		return fmt.Errorf("build debit reversal: %w", err)
+	}
+	return s.entries.PostEntries(ctx, posting.Entries())
+}
+
+func (s *TransferSaga) reverseCredit(ctx context.Context, t *transfer.Transfer) error {
+	floatID := account.FloatAccounts[t.Amount.Currency]
+	// Reversal: dst → float (claws back the credit)
+	posting, err := ledger.NewPosting(
+		ledger.NewTransactionID(), t.DestAccountID, floatID, t.Amount,
+		fmt.Sprintf("REVERSAL credit transfer/%s", t.ID.String()),
+	)
+	if err != nil {
+		return fmt.Errorf("build credit reversal: %w", err)
+	}
+	return s.entries.PostEntries(ctx, posting.Entries())
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+func (s *TransferSaga) failWith(ctx context.Context, t *transfer.Transfer, reason string) error {
 	t.FailureReason = reason
+	if t.State == transfer.StateFailed {
+		return nil // already failed — idempotent
+	}
 	if err := t.Transition(transfer.StateFailed); err != nil {
-		if t.State == transfer.StateFailed {
-			return nil // already failed, idempotent
-		}
 		return err
 	}
 	if err := s.transfers.UpdateState(ctx, t); err != nil {
-		return fmt.Errorf("update transfer to failed: %w", err)
+		return fmt.Errorf("update state to failed: %w", err)
 	}
-	log.Warn("saga: transfer failed", "reason", reason)
-	return s.appendAndPublish(ctx, t, transfer.EventTransferFailed, log)
+	s.log.Warn("transfer failed", "transfer_id", t.ID.String(), "reason", reason)
+	return s.publishEvent(ctx, t, transfer.EventTransferFailed)
 }
 
-func (s *TransferSaga) appendAndPublish(ctx context.Context, t *transfer.Transfer, typ transfer.EventType, log *slog.Logger) error {
+func (s *TransferSaga) publishEvent(ctx context.Context, t *transfer.Transfer, typ transfer.EventType) error {
 	evt := transfer.NewEvent(t, typ)
 	if err := s.events.Append(ctx, evt); err != nil {
 		return fmt.Errorf("append event: %w", err)
 	}
 
-	payload, err := json.Marshal(sagaMessage{
-		TransferID: t.ID.String(),
-		EventType:  string(typ),
-		State:      string(t.State),
-		Timestamp:  time.Now().UTC(),
-	})
+	payload, err := json.Marshal(struct {
+		TransferID string    `json:"transfer_id"`
+		EventType  string    `json:"event_type"`
+		State      string    `json:"state"`
+		Timestamp  time.Time `json:"timestamp"`
+	}{t.ID.String(), string(typ), string(t.State), time.Now().UTC()})
 	if err != nil {
-		return fmt.Errorf("marshal saga message: %w", err)
-	}
-	if err := s.outbox.Write(ctx, string(typ), payload); err != nil {
-		return fmt.Errorf("write outbox: %w", err)
+		return fmt.Errorf("marshal event payload: %w", err)
 	}
 
-	log.Info("saga: event published", "event_type", string(typ))
-	return nil
-}
-
-type sagaMessage struct {
-	TransferID string    `json:"transfer_id"`
-	EventType  string    `json:"event_type"`
-	State      string    `json:"state"`
-	Timestamp  time.Time `json:"timestamp"`
-}
-
-// floatAccount returns the system float/clearing account for a given currency.
-// In production this would be looked up from configuration or the database.
-func floatAccount(currency ledger.Currency) ledger.AccountID {
-	// Deterministic UUID derived from currency — always the same float account per currency.
-	id, _ := ledger.ParseAccountID(fmt.Sprintf("00000000-0000-0000-%04s-000000000000",
-		fmt.Sprintf("%-4s", string(currency))))
-	return id
+	return s.outbox.Write(ctx, string(typ), payload)
 }

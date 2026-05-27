@@ -5,9 +5,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/account"
+	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/money"
 )
 
-// EntryType distinguishes the side of the ledger an entry sits on.
+// EntryType distinguishes which side of the ledger an entry sits on.
 type EntryType string
 
 const (
@@ -15,7 +18,7 @@ const (
 	EntryTypeCredit EntryType = "CREDIT"
 )
 
-// LedgerEntryID is a typed identifier for a ledger entry.
+// LedgerEntryID is the typed identity for a single ledger line.
 type LedgerEntryID struct{ uuid.UUID }
 
 func NewLedgerEntryID() LedgerEntryID { return LedgerEntryID{uuid.New()} }
@@ -27,7 +30,7 @@ func ParseLedgerEntryID(s string) (LedgerEntryID, error) {
 	return LedgerEntryID{id}, nil
 }
 
-// TransactionID groups the two (or more) entries that form a double-entry posting.
+// TransactionID groups the two entries that form a balanced double-entry posting.
 type TransactionID struct{ uuid.UUID }
 
 func NewTransactionID() TransactionID { return TransactionID{uuid.New()} }
@@ -39,33 +42,20 @@ func ParseTransactionID(s string) (TransactionID, error) {
 	return TransactionID{id}, nil
 }
 
-// AccountID is a typed identifier for a ledger account.
-// Defined here (not in the account package) so ledger stays self-contained.
-type AccountID struct{ uuid.UUID }
-
-func NewAccountID() AccountID { return AccountID{uuid.New()} }
-func ParseAccountID(s string) (AccountID, error) {
-	id, err := uuid.Parse(s)
-	if err != nil {
-		return AccountID{}, fmt.Errorf("invalid account ID %q: %w", s, err)
-	}
-	return AccountID{id}, nil
-}
-
-// LedgerEntry is an immutable record of a financial movement on an account.
-// Entries are NEVER updated or deleted — corrections happen via reversing entries.
+// LedgerEntry is an immutable record of a financial movement.
+// Entries are NEVER updated or deleted. Corrections use reversing entries.
 type LedgerEntry struct {
 	ID            LedgerEntryID
 	TransactionID TransactionID
-	AccountID     AccountID
+	AccountID     account.AccountID // semantic owner: account, not ledger
 	Type          EntryType
-	Amount        Money   // always positive; sign is conveyed by Type
+	Amount        money.Money // always positive; sign conveyed by Type
 	Description   string
 	CreatedAt     time.Time
 }
 
-// SignedAmount returns the amount with the sign implied by entry type:
-// debits are negative (money leaves account), credits are positive.
+// SignedAmount returns the amount with sign implied by entry type:
+// DEBIT is negative (money leaves account), CREDIT is positive.
 func (e LedgerEntry) SignedAmount() int64 {
 	if e.Type == EntryTypeDebit {
 		return -e.Amount.Amount

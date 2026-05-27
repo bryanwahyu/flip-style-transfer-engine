@@ -2,9 +2,7 @@ package ledger
 
 import "errors"
 
-var (
-	ErrNegativeAmount   = errors.New("amount must be non-negative")
-	ErrCurrencyMismatch = errors.New("currency mismatch")
-	ErrInsufficientFunds = errors.New("insufficient funds")
-	ErrDoubleEntryViolation = errors.New("ledger entries do not sum to zero")
-)
+// ErrDoubleEntryViolation is the only error the ledger package owns.
+// All other financial errors (insufficient funds, currency mismatch) belong
+// to the money package where they are defined.
+var ErrDoubleEntryViolation = errors.New("ledger entries do not sum to zero")

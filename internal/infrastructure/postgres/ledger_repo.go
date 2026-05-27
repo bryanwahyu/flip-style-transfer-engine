@@ -7,18 +7,16 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/account"
 	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/ledger"
+	"github.com/bryanwahyu/flip-style-transfer-engine/internal/domain/money"
 )
 
-// LedgerRepo implements port.LedgerRepository.
-// Balance is always computed as SUM(signed_amount) — never stored as a cached column.
-type LedgerRepo struct {
-	db *pgxpool.Pool
-}
+// LedgerRepo implements port.EntryWriter, port.BalanceReader, and port.LedgerAuditor.
+// Callers receive only the interface they need (ISP — see port/repositories.go).
+type LedgerRepo struct{ db *pgxpool.Pool }
 
-func NewLedgerRepo(db *pgxpool.Pool) *LedgerRepo {
-	return &LedgerRepo{db: db}
-}
+func NewLedgerRepo(db *pgxpool.Pool) *LedgerRepo { return &LedgerRepo{db: db} }
 
 func (r *LedgerRepo) PostEntries(ctx context.Context, entries []ledger.LedgerEntry) error {
 	tx, err := r.db.Begin(ctx)
@@ -33,8 +31,8 @@ func (r *LedgerRepo) PostEntries(ctx context.Context, entries []ledger.LedgerEnt
 				id, transaction_id, account_id, entry_type,
 				amount, currency, description, created_at
 			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-			e.ID.String(),
-			e.TransactionID.String(),
+			e.ID.UUID.String(),
+			e.TransactionID.UUID.String(),
 			e.AccountID.String(),
 			string(e.Type),
 			e.Amount.Amount,
@@ -43,14 +41,14 @@ func (r *LedgerRepo) PostEntries(ctx context.Context, entries []ledger.LedgerEnt
 			e.CreatedAt,
 		)
 		if err != nil {
-			return fmt.Errorf("insert ledger entry %s: %w", e.ID.String(), err)
+			return fmt.Errorf("insert ledger entry: %w", err)
 		}
 	}
 
 	return tx.Commit(ctx)
 }
 
-func (r *LedgerRepo) GetBalance(ctx context.Context, accountID ledger.AccountID, currency ledger.Currency) (ledger.Money, error) {
+func (r *LedgerRepo) GetBalance(ctx context.Context, accountID account.AccountID, currency money.Currency) (money.Money, error) {
 	var balance int64
 	err := r.db.QueryRow(ctx, `
 		SELECT COALESCE(
@@ -62,9 +60,9 @@ func (r *LedgerRepo) GetBalance(ctx context.Context, accountID ledger.AccountID,
 		accountID.String(), string(currency),
 	).Scan(&balance)
 	if err != nil {
-		return ledger.Money{}, fmt.Errorf("get balance for %s: %w", accountID.String(), err)
+		return money.Money{}, fmt.Errorf("get balance for %s: %w", accountID, err)
 	}
-	return ledger.Money{Amount: balance, Currency: currency}, nil
+	return money.Money{Amount: balance, Currency: currency}, nil
 }
 
 func (r *LedgerRepo) GetAllEntries(ctx context.Context) ([]ledger.LedgerEntry, error) {
@@ -79,35 +77,26 @@ func (r *LedgerRepo) GetAllEntries(ctx context.Context) ([]ledger.LedgerEntry, e
 	var entries []ledger.LedgerEntry
 	for rows.Next() {
 		var (
-			id, txID, accountID string
-			entryType, currency  string
-			amount              int64
-			description         string
-			createdAt           time.Time
+			id, txID, accountID         string
+			entryType, currency         string
+			amount                      int64
+			description                 string
+			createdAt                   time.Time
 		)
 		if err := rows.Scan(&id, &txID, &accountID, &entryType, &amount, &currency, &description, &createdAt); err != nil {
 			return nil, fmt.Errorf("scan ledger entry: %w", err)
 		}
 
-		entryID, err := ledger.ParseLedgerEntryID(id)
-		if err != nil {
-			return nil, err
-		}
-		transactionID, err := ledger.ParseTransactionID(txID)
-		if err != nil {
-			return nil, err
-		}
-		acctID, err := ledger.ParseAccountID(accountID)
-		if err != nil {
-			return nil, err
-		}
+		entryID, _ := ledger.ParseLedgerEntryID(id)
+		transactionID, _ := ledger.ParseTransactionID(txID)
+		acctID, _ := account.ParseAccountID(accountID)
 
 		entries = append(entries, ledger.LedgerEntry{
 			ID:            entryID,
 			TransactionID: transactionID,
 			AccountID:     acctID,
 			Type:          ledger.EntryType(entryType),
-			Amount:        ledger.Money{Amount: amount, Currency: ledger.Currency(currency)},
+			Amount:        money.Money{Amount: amount, Currency: money.Currency(currency)},
 			Description:   description,
 			CreatedAt:     createdAt,
 		})
